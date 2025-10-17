@@ -1,0 +1,74 @@
+name: "GHAS Baseline (Crisp)"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+
+jobs:
+  codeql-baseline:
+    name: "CodeQL Baseline (Java/JS/TS)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Probe languages (Java / JavaScript / TypeScript)
+        id: probe
+        shell: bash
+        run: |
+          languages=""
+          if git ls-files '*.java' | grep -q .; then
+            languages="${languages:+$languages,}java"
+          else
+            echo "Java disabled (no *.java files)"
+          fi
+
+          if git ls-files '*.js' | grep -q .; then
+            languages="${languages:+$languages,}javascript"
+          else
+            echo "JavaScript disabled (no *.js files)"
+          fi
+
+          if git ls-files '*.ts' | grep -q .; then
+            languages="${languages:+$languages,}typescript"
+          else
+            echo "TypeScript disabled (no *.ts files)"
+          fi
+
+          echo "Detected languages: ${languages:-<none>}"
+          echo "languages=$languages" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node (only if JS/TS)
+        if: ${{ contains(steps.probe.outputs.languages, 'javascript') || contains(steps.probe.outputs.languages, 'typescript') }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Initialize CodeQL (default queries, no config, no build)
+        if: ${{ steps.probe.outputs.languages != '' }}
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ steps.probe.outputs.languages }}
+          build-mode: none
+
+      - name: Perform CodeQL Analysis (baseline)
+        if: ${{ steps.probe.outputs.languages != '' }}
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ steps.probe.outputs.languages }}/baseline"
+
+      - name: No supported languages found
+        if: ${{ steps.probe.outputs.languages == '' }}
+        run: |
+          echo "No Java/JavaScript/TypeScript files detected. Skipping CodeQL baseline scan." >> "$GITHUB_STEP_SUMMARY"
