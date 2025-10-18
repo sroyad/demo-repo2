@@ -1,4 +1,4 @@
-name: "AI Triage & Summary Existing Code Scanning Alerts (devs.ai)"
+name: "AI Triage Existing Code Scanning Alerts (devs.ai)"
 
 on:
   workflow_dispatch:   # run manually from Actions
@@ -123,11 +123,10 @@ jobs:
             ```
             """)
 
-          # strict verdict line: REAL_ISSUE or FALSE_POSITIVE
           VERDICT_RX = re.compile(r'^\s*(?:Verdict|Decision)\s*:\s*(REAL_ISSUE|FALSE_POSITIVE)\b', re.I | re.M)
 
           def parse_ai_text(ai_text:str):
-            # take the LAST clean verdict line (skip echoes/instructions)
+            # take the LAST clean verdict line (skip any echoes/instructions)
             last = None
             for m in VERDICT_RX.finditer(ai_text or ""):
               last = m
@@ -140,7 +139,7 @@ jobs:
             return label, confidence, reason
 
           def devs_single_prompt(prompt:str)->dict:
-            # run devs.py and capture reply until the next CLI prompt (> ) or EOF
+            # run devs.py and capture reply until the next CLI prompt ('> ') or EOF
             child = pexpect.spawn("python3", [DEVSPY], encoding="utf-8", timeout=180)
             try:
               child.expect(r'Chat started', timeout=60)
@@ -174,7 +173,7 @@ jobs:
           def safe_path(p:str)->bool:
             p=p.lower(); return any(h in p for h in SAFE_HINTS)
 
-          # 1) Pull alerts (existing Security tab)
+          # 1) Pull alerts (existing in Security tab)
           alerts=[]; page=1
           while len(alerts)<MAX_ALERTS:
             batch=list_alerts(ALERT_STATE, page, min(100, MAX_ALERTS-len(alerts)))
@@ -218,7 +217,7 @@ jobs:
 
           # 3) Summary table (Actions job summary)
           md=[
-            f"Scope: state={ALERT_STATE} | Reviewed: {len(triaged)} | Auto-dismiss: {AUTO_DISMISS.capitalize()}",
+            f"Scope: state={ALERT_STATE} | Reviewed: {len(triaged)} | Auto-dismiss: {'Yes' if AUTO_DISMISS else 'No'}",
             "",
             "| Alert # | Rule | Sev | Path | AI label | Conf | Dismissed |",
             "|---:|---|:---:|---|---|:--:|:--:|",
