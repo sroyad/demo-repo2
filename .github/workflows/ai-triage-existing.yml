@@ -1,34 +1,34 @@
-name: "AI Triage Existing Code Scanning Alerts (devs.ai)"
+name: "AI Triage & Summary Existing Code Scanning Alerts (devs.ai)"
 
 on:
-  workflow_dispatch:   # run manually from Actions tab
+  workflow_dispatch:   # run manually from Actions
   schedule:
-    - cron: "17 3 * * 1"  # optional: every Monday 03:17 UTC
+    - cron: "17 3 * * 1"  # optional weekly run
 
 permissions:
   contents: read
-  security-events: write   # only used if you enable AUTO_DISMISS
+  security-events: write   # only used if AUTO_DISMISS=true
   actions: read
 
 jobs:
   ai-triage-devs:
-    name: AI Triage Existing Alerts
+    name: AI Triage & Summary Existing Alerts
     runs-on: ubuntu-latest
     env:
       OWNER: ${{ github.repository_owner }}
       REPO:  ${{ github.event.repository.name }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Hardcoded devs.ai config (as requested)
+      # devs.ai (hardcoded as requested)
       DEVSAI_API_KEY: "sk-252e3e590b3c9719ee89d030cea655a3a339c503f98f8266"
       DEVSAI_AI_ID:   "5c59c0bf-b78b-4c74-9787-e0bae6225bd5"
       DEVSAI_BASE_URL: "https://devs.ai"
 
-      # Triage policy
-      ALERT_STATE: "open"              # open | fixed | dismissed | all (comma-separated not supported by API)
-      MAX_ALERTS: "300"                # cap to control time/cost
-      AUTO_DISMISS: "false"            # set "true" after you trust it
-      DISMISS_REASON: "false positive" # GitHub requires a reason string
+      # triage knobs
+      ALERT_STATE: "open"              # open | fixed | dismissed | all
+      MAX_ALERTS: "300"
+      AUTO_DISMISS: "false"            # set to "true" after you trust it
+      DISMISS_REASON: "false positive"
       SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
 
     steps:
@@ -37,8 +37,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Commit your CLI to this exact path:
-      #   .github/tools/devs.py
       - name: Ensure devs.py is present
         run: |
           test -f .github/tools/devs.py || { echo "devs.py missing at .github/tools/devs.py"; exit 1; }
@@ -64,7 +62,7 @@ jobs:
       - name: Triage existing Code Scanning alerts with devs.ai
         run: |
           python3 - << 'PY'
-          import os, json, base64, textwrap, re, requests, pexpect, sys
+          import os, json, base64, re, textwrap, requests, pexpect
 
           OWNER=os.environ["OWNER"]; REPO=os.environ["REPO"]
           GH=os.environ["GITHUB_TOKEN"]
@@ -76,41 +74,44 @@ jobs:
           DEVSPY=".github/tools/devs.py"
           SUMMARY_PATH=os.environ.get("GITHUB_STEP_SUMMARY")
 
-          s=requests.Session()
-          s.headers.update({"Authorization": f"Bearer {GH}", "Accept":"application/vnd.github+json"})
+          sess=requests.Session()
+          sess.headers.update({"Authorization": f"Bearer {GH}", "Accept":"application/vnd.github+json"})
 
-          def list_alerts(state="open", page=1, per_page=100):
+          def list_alerts(state, page, per_page):
             url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
-            r=s.get(url, params={"state":state, "page":page, "per_page":per_page, "sort":"created","direction":"desc"}, timeout=60)
+            r=sess.get(url, params={"state":state, "page":page, "per_page":per_page, "sort":"created","direction":"desc"}, timeout=60)
             r.raise_for_status(); return r.json()
 
           def get_file_snippet(path, ref_sha, start, end, ctx=10):
             if not path: return ""
             url=f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{path}"
-            r=s.get(url, params={"ref": ref_sha}, timeout=60)
+            r=sess.get(url, params={"ref":ref_sha or "HEAD"}, timeout=60)
             if r.status_code!=200: return ""
-            j=r.json(); content=base64.b64decode(j.get("content","")).decode("utf-8","ignore")
+            j=r.json()
+            content=base64.b64decode(j.get("content","")).decode("utf-8","ignore")
             lines=content.splitlines()
-            sline=max(1,(start or 1)-ctx); eline=min(len(lines),(end or start or 1)+ctx)
-            return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(sline-1, eline))
+            s=max(1,(start or 1)-ctx); e=min(len(lines),(end or start or 1)+ctx)
+            return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(s-1,e))
 
           def prompt_for_alert(a, snippet):
-            tool=(a.get("tool") or {}).get("name","")
-            if tool and tool.lower()!="codeql":
-              tool_info=f"(tool={tool})"
-            else:
-              tool_info="(tool=CodeQL)"
             rule=a.get("rule",{}) or {}
+            tool=(a.get("tool") or {}).get("name","")
             rule_id=rule.get("id",""); rule_name=rule.get("name","")
             precision=(rule.get("precision") or "").lower()
-            sev=(a.get("rule_severity") or a.get("severity") or "").upper()
+            sev=(a.get("rule_severity") or a.get("severity") or "")
             inst=a.get("most_recent_instance") or {}
             loc=(inst.get("location") or {})
-            path=loc.get("path",""); start=loc.get("start_line"); end=loc.get("end_line")
-            msg=inst.get("message"); msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
+            path=loc.get("path",""); start=loc.get("start_line"); msg=inst.get("message")
+            msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
             return textwrap.dedent(f"""
-            You are an AppSec engineer triaging a CodeQL alert already present in GitHub's Security tab. Decide if this is LIKELY_FALSE_POSITIVE or REAL_ISSUE. Be conservative.
-            Repository: {OWNER}/{REPO} {tool_info}
+            You are an AppSec engineer triaging a CodeQL alert already present in GitHub's Security tab.
+            Output format requirements:
+            1) First line must be exactly one of:
+               "Verdict: REAL_ISSUE"  or  "Verdict: FALSE_POSITIVE"
+            2) Then provide a short "Why" explanation (<= 10 bullets or 800 chars).
+            3) Optionally add a "Recommended fix" or "Why ignorable" line.
+
+            Repository: {OWNER}/{REPO} (tool={tool or 'CodeQL'})
             Rule: {rule_id} | {rule_name} | precision={precision}
             Severity: {sev}
             File: {path}:{start}
@@ -120,61 +121,69 @@ jobs:
             ```
             {snippet}
             ```
-
-            Respond in compact JSON:
-            {{
-              "label": "likely_false_positive" | "real_issue" | "needs_review",
-              "confidence": "low" | "medium" | "high",
-              "reason": "... (<=400 chars)",
-              "suggestions": "..."
-            }}
             """)
 
-          def devs_oneshot(prompt:str)->dict:
-            child = pexpect.spawn("python3", [DEVSPY], encoding="utf-8", timeout=120)
+          VERDICT_RX = re.compile(r'^\s*(?:Verdict|Decision)\s*:\s*(REAL_ISSUE|FALSE_POSITIVE)\b', re.I | re.M)
+
+          def parse_ai_text(ai_text:str):
+            # take the LAST clean verdict line (skip any echoes/instructions)
+            last = None
+            for m in VERDICT_RX.finditer(ai_text or ""):
+              last = m
+            if not last:
+              return "needs_review", "low", (ai_text or "")[:1200]
+            verdict = last.group(1).upper()
+            label = "real_issue" if verdict == "REAL_ISSUE" else "likely_false_positive"
+            confidence = "high"
+            reason = (ai_text[last.end():].strip() or "(no explanation)")[:1200]
+            return label, confidence, reason
+
+          def devs_single_prompt(prompt:str)->dict:
+            # run devs.py and capture reply until the next CLI prompt ('> ') or EOF
+            child = pexpect.spawn("python3", [DEVSPY], encoding="utf-8", timeout=180)
             try:
-              child.expect("Chat started", timeout=60)
+              child.expect(r'Chat started', timeout=60)
             except Exception:
               pass
+
             child.sendline(prompt)
+
             buf=[]
-            for _ in range(200):
+            while True:
               try:
-                line=child.readline()
+                line = child.readline()
               except Exception:
                 break
               if not line:
                 break
               if line.strip().startswith("> "):
                 break
-              buf.append(line.rstrip("\n"))
-            child.sendline("/exit")
-            try: child.expect(pexpect.EOF, timeout=5)
-            except Exception: pass
-            out="\n".join(buf).strip()
-            m=re.search(r'\{.*\}', out, re.S)
-            if m:
-              try: return json.loads(m.group(0))
-              except Exception: pass
-            verdict="needs_review"; conf="low"
-            if re.search(r'likely\s*false\s*positive', out, re.I): verdict="likely_false_positive"; conf="medium"
-            if re.search(r'likely\s*real', out, re.I) or re.search(r'\breal issue\b', out, re.I): verdict="real_issue"; conf="medium"
-            return {"label":verdict, "confidence":conf, "reason":out[:400], "suggestions":""}
+              buf.append(line)
+
+            try:
+              child.sendline("/exit")
+              child.expect(pexpect.EOF, timeout=5)
+            except Exception:
+              pass
+
+            ai_text="".join(buf)
+            label, conf, reason = parse_ai_text(ai_text)
+            return {"label":label, "confidence":conf, "reason":reason, "suggestions":""}
 
           def safe_path(p:str)->bool:
             p=p.lower(); return any(h in p for h in SAFE_HINTS)
 
-          # 1) Pull existing alerts from Security tab
+          # 1) Pull alerts (existing in Security tab)
           alerts=[]; page=1
           while len(alerts)<MAX_ALERTS:
-            batch=list_alerts(ALERT_STATE, page=page, per_page=min(100, MAX_ALERTS-len(alerts)))
+            batch=list_alerts(ALERT_STATE, page, min(100, MAX_ALERTS-len(alerts)))
             if not batch: break
             alerts.extend(batch); page+=1
 
-          # Only keep CodeQL alerts
+          # Only CodeQL alerts
           alerts=[a for a in alerts if (a.get("tool") or {}).get("name","").lower()=="codeql"]
 
-          # 2) Triage with devs.ai
+          # 2) Triage
           triaged=[]
           for a in alerts:
             inst=a.get("most_recent_instance") or {}
@@ -182,9 +191,11 @@ jobs:
             path=loc.get("path") or ""
             start=loc.get("start_line") or 1
             end=loc.get("end_line") or start
-            ref_sha = inst.get("commit_sha") or a.get("most_recent_analysis_commit_sha") or ""
+            ref_sha = inst.get("commit_sha") or a.get("most_recent_analysis_commit_sha") or "HEAD"
             snippet=get_file_snippet(path, ref_sha, start, end)
-            ai=devs_oneshot(prompt_for_alert(a, snippet))
+            prompt=prompt_for_alert(a, snippet)
+            ai=devs_single_prompt(prompt)
+
             rec={
               "alert_number": a.get("number"),
               "rule_id": (a.get("rule") or {}).get("id"),
@@ -192,32 +203,32 @@ jobs:
               "path": path,
               "ai_label": ai.get("label","needs_review"),
               "confidence": ai.get("confidence","low"),
-              "reason": ai.get("reason","")[:400],
-              "suggestions": ai.get("suggestions","")[:300],
+              "reason": ai.get("reason","")[:1200],
+              "suggestions": ai.get("suggestions","")[:400],
               "dismissed": False
             }
+
             if AUTO_DISMISS and rec["ai_label"]=="likely_false_positive" and rec["confidence"] in ("high","medium") and safe_path(path):
               url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
-              r=s.patch(url, json={"state":"dismissed","dismissed_reason":DISMISS_REASON}, timeout=60)
+              r=sess.patch(url, json={"state":"dismissed","dismissed_reason":DISMISS_REASON}, timeout=60)
               rec["dismissed"]= r.status_code in (200,201)
+
             triaged.append(rec)
 
-          # 3) Write Job Summary
-          md_lines=[
-            f"## devs.ai triage for existing alerts",
+          # 3) Summary table (Actions job summary)
+          md=[
+            f"Scope: state={ALERT_STATE} | Reviewed: {len(triaged)} | Auto-dismiss: {'Yes' if AUTO_DISMISS else 'No'}",
             "",
-            f"Scope: **state={ALERT_STATE}**, CodeQL-only | Reviewed: **{len(triaged)}** | Auto-dismiss: **{AUTO_DISMISS}**",
-            "",
-            "| Alert # | Rule | Sev | Path | AI label | Dismissed |",
-            "|---:|---|:---:|---|---|:--:|",
+            "| Alert # | Rule | Sev | Path | AI label | Conf | Dismissed |",
+            "|---:|---|:---:|---|---|:--:|:--:|",
           ]
           for r in triaged:
-            md_lines.append(f"| {r['alert_number']} | `{r['rule_id']}` | {r['severity']} | `{r['path']}` | **{r['ai_label']}** ({r['confidence']}) | {'✔️' if r['dismissed'] else ''} |")
+            md.append(f"| {r['alert_number']} | `{r['rule_id']}` | {r['severity'] or ''} | `{r['path']}` | **{r['ai_label']}** | {r['confidence']} | {'✔️' if r['dismissed'] else ''} |")
           if SUMMARY_PATH:
             with open(SUMMARY_PATH, "a", encoding="utf-8") as f:
-              f.write("\n".join(md_lines) + "\n")
+              f.write("\n".join(md) + "\n")
 
-          # 4) Save JSON artifact
+          # 4) Artifact (full reasoning)
           with open("devs-ai-triage.json","w",encoding="utf-8") as f:
             json.dump(triaged, f, indent=2)
 
