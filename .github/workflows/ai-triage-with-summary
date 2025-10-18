@@ -1,0 +1,262 @@
+name: "AI Triage Existing Code Scanning Alerts (devs.ai)"
+
+on:
+  workflow_dispatch:   # run manually in Actions tab
+  schedule:
+    - cron: "17 3 * * 1"  # optional: every Monday 03:17 UTC
+
+permissions:
+  contents: read
+  security-events: write   # used only if AUTO_DISMISS is true
+  actions: read
+
+jobs:
+  ai-triage-devs:
+    name: AI Triage Existing Alerts
+    runs-on: ubuntu-latest
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPO:  ${{ github.event.repository.name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- devs.ai (hardcoded as requested) ---
+      DEVSAI_API_KEY: "sk-252e3e590b3c9719ee89d030cea655a3a339c503f98f8266"
+      DEVSAI_AI_ID:   "5c59c0bf-b78b-4c74-9787-e0bae6225bd5"
+      DEVSAI_BASE_URL: "https://devs.ai"
+
+      # --- triage policy / knobs ---
+      ALERT_STATE: "open"              # open | fixed | dismissed | all
+      MAX_ALERTS: "300"                # cap to control time/cost
+      AUTO_DISMISS: "false"            # flip to "true" once you trust it
+      DISMISS_REASON: "false positive" # GitHub requires a reason
+      SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
+
+    steps:
+      - name: Checkout (for code context)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure devs.py is present
+        run: |
+          test -f .github/tools/devs.py || { echo "devs.py missing at .github/tools/devs.py"; exit 1; }
+          python3 --version
+
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests pexpect
+
+      - name: Configure devs.ai CLI (headless; uses your hardcoded key)
+        run: |
+          mkdir -p "$HOME/.devscli"
+          cat > "$HOME/.devscli/config.json" <<JSON
+          {
+            "api_key": "${DEVSAI_API_KEY}",
+            "selected_ai_id": "${DEVSAI_AI_ID}",
+            "base_url": "${DEVSAI_BASE_URL}"
+          }
+          JSON
+          echo "devs.ai CLI configured."
+
+      - name: Triage existing Code Scanning alerts with devs.ai
+        run: |
+          python3 - << 'PY'
+          import os, json, base64, re, textwrap, requests, pexpect
+
+          OWNER=os.environ["OWNER"]; REPO=os.environ["REPO"]
+          GH=os.environ["GITHUB_TOKEN"]
+          ALERT_STATE=os.getenv("ALERT_STATE","open")
+          MAX_ALERTS=int(os.getenv("MAX_ALERTS","300"))
+          AUTO_DISMISS=os.getenv("AUTO_DISMISS","false").lower()=="true"
+          DISMISS_REASON=os.getenv("DISMISS_REASON","false positive")
+          SAFE_HINTS=[s.strip().lower() for s in os.getenv("SAFE_PATH_HINTS","").split(",") if s.strip()]
+          DEVSPY=".github/tools/devs.py"
+          SUMMARY_PATH=os.environ.get("GITHUB_STEP_SUMMARY")
+
+          sess=requests.Session()
+          sess.headers.update({"Authorization": f"Bearer {GH}", "Accept":"application/vnd.github+json"})
+
+          def list_alerts(state, page, per_page):
+            url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
+            r=sess.get(url, params={"state":state, "page":page, "per_page":per_page, "sort":"created","direction":"desc"}, timeout=60)
+            r.raise_for_status(); return r.json()
+
+          def get_file_snippet(path, ref_sha, start, end, ctx=10):
+            if not path: return ""
+            url=f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{path}"
+            r=sess.get(url, params={"ref":ref_sha or "HEAD"}, timeout=60)
+            if r.status_code!=200: return ""
+            j=r.json()
+            content=base64.b64decode(j.get("content","")).decode("utf-8","ignore")
+            lines=content.splitlines()
+            s=max(1,(start or 1)-ctx); e=min(len(lines),(end or start or 1)+ctx)
+            return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(s-1,e))
+
+          def prompt_for_alert(a, snippet):
+            rule=a.get("rule",{}) or {}
+            tool=(a.get("tool") or {}).get("name","")
+            rule_id=rule.get("id",""); rule_name=rule.get("name","")
+            precision=(rule.get("precision") or "").lower()
+            sev=(a.get("rule_severity") or a.get("severity") or "")
+            inst=a.get("most_recent_instance") or {}
+            loc=(inst.get("location") or {})
+            path=loc.get("path",""); start=loc.get("start_line"); msg=inst.get("message")
+            msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
+            return textwrap.dedent(f"""
+            You are an AppSec engineer triaging a CodeQL alert already present in GitHub's Security tab. Decide if this is LIKELY_FALSE_POSITIVE or REAL_ISSUE. Be conservative.
+
+            Repository: {OWNER}/{REPO} (tool={tool or 'CodeQL'})
+            Rule: {rule_id} | {rule_name} | precision={precision}
+            Severity: {sev}
+            File: {path}:{start}
+            Message: {msg}
+
+            Code context (±10 lines):
+            ```
+            {snippet}
+            ```
+
+            Respond beginning with:
+            "Verdict: Likely REAL_ISSUE"  or  "Verdict: Likely FALSE_POSITIVE"
+            Then provide a short "Why" explanation and a brief "Recommended fix" or "Why ignorable".
+            """)
+
+          def parse_ai_text(ai_text:str):
+            # Extract verdict line & treat remainder as reasoning
+            verdict_line=None
+            lines=ai_text.splitlines()
+            for ln in lines:
+              if ln.strip().lower().startswith("verdict:"):
+                verdict_line=ln.strip().lower()
+                break
+            label="needs_review"; conf="low"
+            if verdict_line:
+              if "false" in verdict_line: label="likely_false_positive"
+              elif "real" in verdict_line: label="real_issue"
+              conf="medium"
+            # Reason = AI text (trim)
+            reason=ai_text.strip()
+            # keep at most ~1200 chars to avoid huge logs/artifact
+            return label, conf, reason[:1200]
+
+          def devs_single_prompt(prompt:str)->dict:
+            """
+            Run devs.py interactively, send one prompt, capture ONLY the AI's reply
+            starting from 'Verdict:' until the next CLI prompt ('> ') or EOF.
+            """
+            child = pexpect.spawn("python3", [DEVSPY], encoding="utf-8", timeout=180)
+            try:
+              child.expect(r'Chat started', timeout=60)
+            except Exception:
+              pass
+
+            child.sendline(prompt)
+
+            # Wait until 'Verdict:' appears; if not, bail out
+            try:
+              child.expect(r'Verdict:', timeout=150)
+            except pexpect.TIMEOUT:
+              try: child.sendline("/exit")
+              except Exception: pass
+              return {"label":"needs_review","confidence":"low","reason":"No AI verdict produced within timeout.","suggestions":""}
+
+            # We matched the start of the verdict; include that line and keep reading
+            buf=["Verdict:" + child.readline()]
+            while True:
+              try:
+                line = child.readline()
+              except Exception:
+                break
+              if not line:
+                break
+              # stop at next CLI prompt
+              if line.strip().startswith("> "):
+                break
+              buf.append(line)
+
+            # cleanup
+            try:
+              child.sendline("/exit")
+              child.expect(pexpect.EOF, timeout=5)
+            except Exception:
+              pass
+
+            ai_text="".join(buf)
+            label, conf, reason = parse_ai_text(ai_text)
+            return {"label":label, "confidence":conf, "reason":reason, "suggestions":""}
+
+          def safe_path(p:str)->bool:
+            p=p.lower(); return any(h in p for h in SAFE_HINTS)
+
+          # --- 1) Get existing alerts from Security tab ---
+          alerts=[]; page=1
+          while len(alerts)<MAX_ALERTS:
+            batch=list_alerts(ALERT_STATE, page, min(100, MAX_ALERTS-len(alerts)))
+            if not batch: break
+            alerts.extend(batch); page+=1
+
+          # keep only CodeQL alerts
+          alerts=[a for a in alerts if (a.get("tool") or {}).get("name","").lower()=="codeql"]
+
+          # --- 2) Triage with devs.ai via devs.py ---
+          triaged=[]
+          for a in alerts:
+            inst=a.get("most_recent_instance") or {}
+            loc=(inst.get("location") or {})
+            path=loc.get("path") or ""
+            start=loc.get("start_line") or 1
+            end=loc.get("end_line") or start
+            ref_sha = inst.get("commit_sha") or a.get("most_recent_analysis_commit_sha") or "HEAD"
+            snippet=get_file_snippet(path, ref_sha, start, end)
+            prompt=prompt_for_alert(a, snippet)
+            ai=devs_single_prompt(prompt)
+
+            rec={
+              "alert_number": a.get("number"),
+              "rule_id": (a.get("rule") or {}).get("id"),
+              "severity": a.get("rule_severity") or a.get("severity"),
+              "path": path,
+              "ai_label": ai.get("label","needs_review"),
+              "confidence": ai.get("confidence","low"),
+              "reason": ai.get("reason","")[:1200],
+              "suggestions": ai.get("suggestions","")[:400],
+              "dismissed": False
+            }
+
+            if AUTO_DISMISS and rec["ai_label"]=="likely_false_positive" and rec["confidence"] in ("high","medium") and safe_path(path):
+              url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
+              r=sess.patch(url, json={"state":"dismissed","dismissed_reason":DISMISS_REASON}, timeout=60)
+              rec["dismissed"]= r.status_code in (200,201)
+
+            triaged.append(rec)
+
+          # --- 3) Job Summary table ---
+          md=[
+            "## devs.ai triage for existing alerts",
+            "",
+            f"Scope: state={ALERT_STATE} | Reviewed: **{len(triaged)}** | Auto-dismiss: **{AUTO_DISMISS}**",
+            "",
+            "| Alert # | Rule | Sev | Path | AI label | Conf | Dismissed |",
+            "|---:|---|:---:|---|---|:--:|:--:|",
+          ]
+          for r in triaged:
+            md.append(f"| {r['alert_number']} | `{r['rule_id']}` | {r['severity'] or ''} | `{r['path']}` | **{r['ai_label']}** | {r['confidence']} | {'✔️' if r['dismissed'] else ''} |")
+          if SUMMARY_PATH:
+            with open(SUMMARY_PATH, "a", encoding="utf-8") as f:
+              f.write("\n".join(md) + "\n")
+
+          # --- 4) Artifact ---
+          with open("devs-ai-triage.json","w",encoding="utf-8") as f:
+            json.dump(triaged, f, indent=2)
+
+          print("Triage complete. See Job Summary and devs-ai-triage.json artifact.")
+          PY
+
+      - name: Upload triage JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devs-ai-triage
+          path: devs-ai-triage.json
+          if-no-files-found: error
