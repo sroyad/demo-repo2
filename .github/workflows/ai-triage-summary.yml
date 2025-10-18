@@ -1,4 +1,4 @@
-name: "AI Triage Existing Code Scanning Alerts (devs.ai)"
+name: "AI Triage & Summary Existing Code Scanning Alerts (devs.ai)"
 
 on:
   workflow_dispatch:   # run manually from Actions
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   ai-triage-devs:
-    name: AI Triage Existing Alerts
+    name: AI Triage & Summary Existing Alerts
     runs-on: ubuntu-latest
     env:
       OWNER: ${{ github.repository_owner }}
