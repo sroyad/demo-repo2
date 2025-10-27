@@ -29,21 +29,19 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          # keep light; using regex + heuristics for POC; tree-sitter optional
-          python -m pip install "regex" "tqdm"
+          python -m pip install regex tqdm
 
       - name: Generate repo context (summary + cards)
         shell: bash
         run: |
           python - << 'PY'
-          import os, re, json, pathlib, hashlib
+          import os, re, json, pathlib
           from tqdm import tqdm
 
           ROOT = pathlib.Path(".")
           OUT  = pathlib.Path("context")
           OUT.mkdir(parents=True, exist_ok=True)
 
-          # ---------- helpers ----------
           CODE_EXTS = {".js",".ts",".jsx",".tsx",".py",".java",".kt",".go",".rb",".php",".cs",".scala",".rs",".c",".cpp"}
           IGNORE_SEG = {"node_modules","vendor","dist","build","coverage","__tests__","tests","test",".git",".github",".next",".cache"}
 
@@ -53,8 +51,7 @@ jobs:
             for seg in path.parts:
               if seg in IGNORE_SEG: return False
             try:
-              if path.stat().st_size > 300_000:  # skip very large files
-                return False
+              if path.stat().st_size > 300_000: return False
             except: return False
             return True
 
@@ -62,28 +59,20 @@ jobs:
             try: return p.read_text(encoding="utf-8", errors="ignore")
             except: return ""
 
-          # ---------- scan all code quickly ----------
           files = [p for p in ROOT.rglob("*") if want(p)]
-          big_blob = []
-          for p in files[:5000]:  # hard cap for giant repos (POC)
-            t = read_text(p)
-            big_blob.append(t)
 
-          all_code = "\n".join(big_blob)
+          # ----- repo-wide heuristics -----
+          all_code = "\n".join(read_text(p) for p in files[:5000])
 
-          # ---------- repo-wide heuristics (fast & generic) ----------
-          def has(pattern, text=all_code, flags=re.I):
-            return re.search(pattern, text, flags) is not None
+          def has(pat): return re.search(pat, all_code, re.I) is not None
 
           # auth transport guess
           auth_model = "unknown"
           if has(r'\bAuthorization\b') or has(r'\breq\.headers\.authorization\b'):
             auth_model = "header-jwt"
-          if has(r'cookie', all_code) and has(r'jwt', all_code):
-            # cookie wins if we see explicit jwt-in-cookie patterns
+          if has(r'cookie') and has(r'jwt'):
             auth_model = "cookie-jwt"
           if has(r'session|express-session|flask\.session|django\.contrib\.sessions'):
-            # session cookies likely
             auth_model = "session-cookie"
 
           frameworks = []
@@ -99,7 +88,7 @@ jobs:
             if has(sig): frameworks.append(name)
 
           protections = {
-            "csrf": "present" if has(r'csrf') or has(r'Csrf|CSRF') else "unknown",
+            "csrf": "present" if has(r'csrf|Csrf') else "unknown",
             "cors": "present" if has(r'\bcors\b') else "unknown",
             "xss_sanitize": "present" if has(r'sanitize|dompurify|bleach|html\.escape|xss') else "unknown",
             "ssrf_controls": "present" if has(r'allowlist|whitelist|http(s)?\.Agent|proxy') else "unknown",
@@ -113,21 +102,19 @@ jobs:
           }
           (OUT/"repo_summary.json").write_text(json.dumps(repo_summary, indent=2), encoding="utf-8")
 
-          # ---------- per-file cards ----------
+          # ----- per-file cards -----
           def extract_endpoints(txt: str, suffix: str):
             endpoints = []
             if suffix in (".js",".ts",".jsx",".tsx"):
               for m in re.finditer(r'\b(app|router)\.(get|post|put|patch|delete)\(\s*["\']([^"\']+)', txt, re.I):
                 endpoints.append({"path": m.group(3), "method": m.group(2).upper()})
             if suffix == ".py":
-              # FastAPI/Flask
               for m in re.finditer(r'@(app|router)\.(get|post|put|patch|delete)\(\s*["\']([^"\']+)', txt, re.I):
                 endpoints.append({"path": m.group(3), "method": m.group(2).upper()})
               for m in re.finditer(r'@app\.route\(\s*["\']([^"\']+).*methods=\[([^\]]+)\]', txt, re.I):
                 meths = [s.strip(" '\"").upper() for s in m.group(2).split(",")]
                 for mm in meths:
                   endpoints.append({"path": m.group(1), "method": mm})
-            # add more frameworks as needed
             return endpoints[:12]
 
           def extract_imports(txt: str, suffix: str):
@@ -138,7 +125,6 @@ jobs:
             elif suffix == ".py":
               imps += [m.group(1) for m in re.finditer(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import', txt, re.M)]
               imps += [m.group(1) for m in re.finditer(r'^\s*import\s+([a-zA-Z0-9_\.]+)', txt, re.M)]
-            # light only; languages can be extended
             return list(dict.fromkeys(imps))[:30]
 
           def extract_sinks_sources(txt: str):
@@ -161,8 +147,7 @@ jobs:
               if re.search(r'\b'+re.escape(kw)+r'\b', txt, re.I): val.add(kw)
             return sorted(san)[:12], sorted(val)[:12]
 
-          cards_path = OUT/"file_cards.jsonl"
-          with cards_path.open("w", encoding="utf-8") as f:
+          with (OUT/"file_cards.jsonl").open("w", encoding="utf-8") as f:
             for p in tqdm(files, desc="cards"):
               txt = read_text(p)
               suffix = p.suffix.lower()
@@ -170,8 +155,6 @@ jobs:
               imports   = extract_imports(txt, suffix)
               sinks, sources = extract_sinks_sources(txt)
               san, val  = extract_sanitizers_validators(txt)
-
-              # extremely small summary (heuristic)
               summary_bits = []
               if endpoints: summary_bits.append(f"{len(endpoints)} endpoints")
               if "Authorization" in txt: summary_bits.append("reads Authorization header")
@@ -179,7 +162,6 @@ jobs:
               if san: summary_bits.append("sanitizers present")
               if val: summary_bits.append("validators present")
               summary = "; ".join(summary_bits) or "general module"
-
               row = {
                 "path": str(p.as_posix()),
                 "language": suffix.lstrip("."),
@@ -217,9 +199,9 @@ jobs:
       DEVSAI_AI_ID:   "5c59c0bf-b78b-4c74-9787-e0bae6225bd5"
       DEVSAI_BASE_URL: "https://devs.ai"
 
-      ALERT_STATE: "open"         # open|fixed|dismissed
+      ALERT_STATE: "open"
       MAX_ALERTS: "200"
-      AUTO_DISMISS: "false"       # set to "true" after you trust it
+      AUTO_DISMISS: "false"
       DISMISS_REASON: "false positive"
       SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
 
@@ -244,6 +226,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests pexpect
 
+      - name: Ensure devs.py is present
+        run: |
+          test -f .github/tools/devs.py || { echo "::error::devs.py missing at .github/tools/devs.py"; exit 1; }
+
       - name: Configure devs.ai CLI (headless)
         run: |
           mkdir -p "$HOME/.devscli"
@@ -265,7 +251,7 @@ jobs:
           DISMISS_REASON=os.getenv("DISMISS_REASON","false positive")
           SAFE_HINTS=[s.strip().lower() for s in os.getenv("SAFE_PATH_HINTS","").split(",") if s.strip()]
           SUMMARY_PATH=os.environ.get("GITHUB_STEP_SUMMARY")
-          DEVSPY=".github/tools/devs.py"  # your existing CLI; if not present, we fall back to simple echo
+          DEVSPY=".github/tools/devs.py"
 
           # ---- load context ----
           repo_summary = {}
@@ -283,7 +269,6 @@ jobs:
           except FileNotFoundError:
             pass
 
-          # quick index
           by_path = {c["path"]: c for c in file_cards}
 
           sess=requests.Session()
@@ -305,7 +290,6 @@ jobs:
             s=max(1,(start or 1)-ctx); e=min(len(lines),(end or start or 1)+ctx)
             return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(s-1,e))
 
-          # ----- retrieval: pick best 3-5 cards (rule-agnostic) -----
           SEC_KEYWORDS = set("render escape encode sanitize template csrf cors jwt cookie header auth session sql query orm exec spawn subprocess popen file upload s3 http axios fetch request urllib xml deserialize serialize pickle jackson gson yaml load proxy dns socket".split())
 
           def keyword_score(text):
@@ -314,25 +298,18 @@ jobs:
 
           def related_cards(main_path, alert_msg, code_slice, k=5):
             cards=[]
-            # 1) direct file
             c = by_path.get(main_path)
             if c: cards.append(c)
-
-            # 2) neighbors by path prefix
             prefix = str(pathlib.Path(main_path).parent).rstrip("/")
             if prefix and prefix!=".":
               neigh = [fc for fc in file_cards if fc["path"].startswith(prefix+"/")]
               neigh = sorted(neigh, key=lambda x: -keyword_score(x.get("summary","")+" "+ " ".join(x.get("imports",[]))))
               cards.extend(neigh[:2])
-
-            # 3) keyword rank against entire repo cards
             basis = (alert_msg or "") + " " + (code_slice or "")
             ranked = sorted(file_cards, key=lambda x: -keyword_score((x.get("summary","")+" "+ " ".join(x.get("imports",[]))+" "+ " ".join(x.get("sinks",[]))+" "+ " ".join(x.get("sources",[]))).lower() + " " + basis.lower()))
             for r in ranked[:5]:
               if r not in cards:
                 cards.append(r)
-
-            # de-dupe & cap
             seen=set(); uniq=[]
             for x in cards:
               key=x["path"]
@@ -341,7 +318,7 @@ jobs:
               if len(uniq)>=k: break
             return uniq
 
-          # ---- devs.ai prompt ----
+          # --- Prompt (few-shot JSON) ---
           def prompt_for_alert(a, snippet, bundle_cards):
             rule=a.get("rule",{}) or {}
             tool=(a.get("tool") or {}).get("name","")
@@ -353,22 +330,42 @@ jobs:
             msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
 
             cards_block = "\n".join([
-              json.dumps({"path": c["path"], "summary": c.get("summary",""), "endpoints": c.get("endpoints",[]),
-                          "sanitizers": c.get("sanitizers",[]), "validators": c.get("validators",[]),
-                          "imports": c.get("imports",[]), "sinks": c.get("sinks",[]), "sources": c.get("sources",[])}, ensure_ascii=False)
-              for c in bundle_cards
+              json.dumps({
+                "path": c["path"],
+                "summary": c.get("summary",""),
+                "endpoints": c.get("endpoints",[]),
+                "sanitizers": c.get("sanitizers",[]),
+                "validators": c.get("validators",[]),
+                "imports": c.get("imports",[]),
+                "sinks": c.get("sinks",[]),
+                "sources": c.get("sources",[])
+              }, ensure_ascii=False) for c in bundle_cards
             ])
 
-            return textwrap.dedent(f"""
-            You are a senior AppSec engineer doing rule-agnostic triage of a CodeQL alert using **whole-repo context**.
+            example = {
+              "classification": "TP",
+              "certainty": 92,
+              "rationale": "Untrusted input reaches query without validation; no sanitizer in path.",
+              "evidence": [{"path": "app/db.js", "lines": "47-59", "reason":"query built from req.body"}],
+              "reproduce_steps": "POST /api/search with crafted body",
+              "fix_suggestion": "Use schema validation / parameterized query."
+            }
 
-            Return **ONLY** a single JSON object with these fields:
+            return textwrap.dedent(f"""
+            You are a senior AppSec engineer doing rule-agnostic triage of a CodeQL alert with whole-repo context.
+
+            Return ONLY a single JSON object with fields:
             - classification: "TP" | "FP" | "UNCERTAIN"
             - certainty: integer 0-100
             - rationale: short text
-            - evidence: array of objects like {{ "path": "...", "lines": "optional", "reason": "..." }}
+            - evidence: array of objects {{ "path": "...", "lines": "optional", "reason": "..." }}
             - reproduce_steps: short text or null
             - fix_suggestion: short text
+
+            Example output:
+            ```json
+            {json.dumps(example, ensure_ascii=False)}
+            ```
 
             Global repo summary:
             {json.dumps(repo_summary, ensure_ascii=False)}
@@ -391,10 +388,7 @@ jobs:
             """)
 
           def call_devs(prompt: str) -> str:
-            # use your existing CLI; if not found, just echo a stub JSON to keep job green
-            if not pathlib.Path(DEVSPY).exists():
-              return json.dumps({"classification":"UNCERTAIN","certainty":50,"rationale":"devs.py not found","evidence":[],"reproduce_steps":None,"fix_suggestion":""})
-            child = pexpect.spawn("python3", [DEVSPY], encoding="utf-8", timeout=180)
+            child = pexpect.spawn("python3", [DEVSPY], encoding="utf-8", timeout=240)
             try:
               child.expect(r'Chat started', timeout=60)
             except Exception:
@@ -406,8 +400,10 @@ jobs:
                 line = child.readline()
               except Exception:
                 break
-              if not line: break
-              if line.strip().startswith("> "): break
+              if not line:
+                break
+              if line.strip().startswith("> "):
+                break
               buf.append(line)
             try:
               child.sendline("/exit")
@@ -416,15 +412,36 @@ jobs:
               pass
             return "".join(buf).strip()
 
-          def parse_json(s: str):
-            # extract first JSON object in text
-            m = re.search(r'\{.*\}', s, re.S)
-            if not m:
-              return {"classification":"UNCERTAIN","certainty":50,"rationale":"no JSON found","evidence":[],"reproduce_steps":None,"fix_suggestion":""}
-            try:
-              return json.loads(m.group(0))
-            except Exception:
-              return {"classification":"UNCERTAIN","certainty":50,"rationale":"invalid JSON","evidence":[],"reproduce_steps":None,"fix_suggestion":""}
+          FENCED_JSON_RX = re.compile(r"```json\s*(\{.*?\})\s*```", re.S|re.I)
+          BARE_JSON_RX   = re.compile(r"(\{(?:[^{}]|(?1))*\})", re.S)
+          VERDICT_RX = re.compile(r'^\s*(?:Verdict|Decision|Assessment|Triage\s*decision)\s*:\s*((?:Likely\s+)?(?:REAL_ISSUE|FALSE_POSITIVE))\b', re.I|re.M)
+
+          def map_old_verdict(tok: str):
+            t=tok.upper().strip()
+            likely=t.startswith("LIKELY ")
+            base=t.replace("LIKELY ","")
+            if base=="REAL_ISSUE": return ("TP", 90 if not likely else 75)
+            if base=="FALSE_POSITIVE": return ("FP", 90 if not likely else 75)
+            return ("UNCERTAIN", 50)
+
+          def parse_ai_reply(text: str):
+            m = FENCED_JSON_RX.search(text or "")
+            if m:
+              try: return json.loads(m.group(1))
+              except Exception: pass
+            m = BARE_JSON_RX.search(text or "")
+            if m:
+              try: return json.loads(m.group(1))
+              except Exception: pass
+            for m in VERDICT_RX.finditer(text or ""):
+              classification, certainty = map_old_verdict(m.group(1))
+              return {
+                "classification": classification,
+                "certainty": certainty,
+                "rationale": (text[m.end():].strip() or "(no explanation)")[:1000],
+                "evidence": [], "reproduce_steps": None, "fix_suggestion": ""
+              }
+            return {"classification":"UNCERTAIN","certainty":50,"rationale":"No JSON/verdict found","evidence":[],"reproduce_steps":None,"fix_suggestion":""}
 
           def safe_path(p: str) -> bool:
             p = (p or "").lower()
@@ -452,9 +469,9 @@ jobs:
             prompt = prompt_for_alert(a, snippet, bundle)
 
             raw = call_devs(prompt)
-            verdict = parse_json(raw)
+            verdict = parse_ai_reply(raw)
 
-            classification = verdict.get("classification","UNCERTAIN").upper()
+            classification = str(verdict.get("classification","UNCERTAIN")).upper()
             certainty = int(verdict.get("certainty", 50))
             rationale = (verdict.get("rationale") or "")[:1000]
 
@@ -469,15 +486,13 @@ jobs:
               "dismissed": False
             }
 
-            # conservative auto-dismiss
             if AUTO_DISMISS and classification=="FP" and certainty>=90 and safe_path(path):
               url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
-              r = sess.patch(url, json={"state":"dismissed","dismissed_reason":os.getenv("DISMISS_REASON","false positive")}, timeout=60)
+              r = sess.patch(url, json={"state":"dismissed","dismissed_reason":DISMISS_REASON}, timeout=60)
               rec["dismissed"] = r.status_code in (200,201)
 
             triaged.append(rec)
 
-          # summary
           lines = [
             f"Repo-aware triage complete.",
             f"Scope: state={ALERT_STATE} | Reviewed: {len(triaged)} | Auto-dismiss: {'ON' if AUTO_DISMISS else 'OFF'}",
