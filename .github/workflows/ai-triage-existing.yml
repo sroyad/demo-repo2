@@ -1,13 +1,13 @@
 name: "AI Triage & Summary Existing Code Scanning Alerts (devs.ai)"
 
 on:
-  workflow_dispatch:   # run manually from Actions
+  workflow_dispatch:
   schedule:
-    - cron: "17 3 * * 1"  # optional weekly run
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
-  security-events: write   # only used if AUTO_DISMISS=true
+  security-events: write
   actions: read
 
 jobs:
@@ -25,9 +25,9 @@ jobs:
       DEVSAI_BASE_URL: "https://devs.ai"
 
       # triage knobs
-      ALERT_STATE: "open"              # open | fixed | dismissed | all
+      ALERT_STATE: "open"
       MAX_ALERTS: "300"
-      AUTO_DISMISS: "false"            # set to "true" after you trust it
+      AUTO_DISMISS: "false"
       DISMISS_REASON: "false positive"
       SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
 
@@ -103,13 +103,20 @@ jobs:
             loc=(inst.get("location") or {})
             path=loc.get("path",""); start=loc.get("start_line"); msg=inst.get("message")
             msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
+
+            # Force a strict, machine-parsable first line, but keep friendly explanation requirement.
             return textwrap.dedent(f"""
             You are an AppSec engineer triaging a CodeQL alert already present in GitHub's Security tab.
-            Output format requirements:
-            1) First line must be exactly one of:
-               "Verdict: REAL_ISSUE"  or  "Verdict: FALSE_POSITIVE"
-            2) Then provide a short "Why" explanation (<= 10 bullets or 800 chars).
-            3) Optionally add a "Recommended fix" or "Why ignorable" line.
+
+            CRITICAL: The model MUST return a single clear first line exactly matching one of:
+            - Verdict: REAL_ISSUE
+            - Verdict: FALSE_POSITIVE
+
+            Then (on subsequent lines) provide:
+            - A short "Why" explanation (<= 10 bullets, <= 800 chars)
+            - Optionally a "Recommended fix" or "Why ignorable" line.
+
+            If unsure, prefer REAL_ISSUE.
 
             Repository: {OWNER}/{REPO} (tool={tool or 'CodeQL'})
             Rule: {rule_id} | {rule_name} | precision={precision}
@@ -123,23 +130,67 @@ jobs:
             ```
             """)
 
-          VERDICT_RX = re.compile(r'^\s*(?:Verdict|Decision)\s*:\s*(REAL_ISSUE|FALSE_POSITIVE)\b', re.I | re.M)
+          # Accept Verdict/Decision/Assessment/Triage decision lines, with optional "Likely " prefix
+          VERDICT_RX = re.compile(
+            r'^\s*(?:Verdict|Decision|Assessment|Triage\s*decision)\s*:\s*((?:Likely\s+)?(?:REAL_ISSUE|FALSE_POSITIVE))\b',
+            re.I | re.M
+          )
+          FALLBACK_RX = re.compile(r'\b((?:Likely\s+)?(?:REAL_ISSUE|FALSE_POSITIVE))\b', re.I)
 
-          def parse_ai_text(ai_text:str):
-            # take the LAST clean verdict line (skip any echoes/instructions)
+          def _map_verdict_token(token: str):
+            t = token.upper().strip()
+            likely = t.startswith("LIKELY ")
+            base = t.replace("LIKELY ", "")
+            label = "real_issue" if base == "REAL_ISSUE" else "likely_false_positive"
+            conf = "medium" if likely else "high"
+            return label, conf
+
+          def heuristic_from_text(text: str):
+            """
+            If the model doesn't give a clean verdict, use heuristic patterns
+            to classify common clear vulnerabilities as real_issue.
+            """
+            t = (text or "").lower()
+            # patterns that strongly indicate a real issue (command exec, db injection, unbounded loops, etc)
+            patterns = [
+              "user-provided", "user controlled", "user-controlled", "req.body", "req.query",
+              "req.params", "req.", "spawn(cmd", "spawn (cmd", "exec(", "child_process.spawn",
+              "command execution", "sql injection", "nosql", "mongodb", "findOne(", "where(", "unbounded",
+              "obj.length", "for (var i = 0; i < obj.length", "while (true)", "regex denial", "xss",
+              "cross-site", "csrf", "remote code execution", "arbitrary program"
+            ]
+            for p in patterns:
+              if p in t:
+                return ("real_issue", "medium", f"Auto-triage heuristic: matched pattern '{p}'")
+            return None
+
+          def parse_ai_text(ai_text: str):
+            text = ai_text or ""
             last = None
-            for m in VERDICT_RX.finditer(ai_text or ""):
+            for m in VERDICT_RX.finditer(text):
               last = m
-            if not last:
-              return "needs_review", "low", (ai_text or "")[:1200]
-            verdict = last.group(1).upper()
-            label = "real_issue" if verdict == "REAL_ISSUE" else "likely_false_positive"
-            confidence = "high"
-            reason = (ai_text[last.end():].strip() or "(no explanation)")[:1200]
-            return label, confidence, reason
+            if last:
+              label, conf = _map_verdict_token(last.group(1))
+              reason = (text[last.end():].strip() or "(no explanation)")[:1200]
+              return label, conf, reason
 
-          def devs_single_prompt(prompt:str)->dict:
-            # run devs.py and capture reply until the next CLI prompt ('> ') or EOF
+            # fallback - look anywhere for a bare verdict token
+            m2 = FALLBACK_RX.search(text)
+            if m2:
+              label, conf = _map_verdict_token(m2.group(1))
+              return label, conf, text[:1200].strip()
+
+            # heuristic: check if the response text or code snippet obviously indicates a real issue
+            heu = heuristic_from_text(text)
+            if heu:
+              return heu
+
+            return "needs_review", "low", text[:1200].strip()
+
+          def devs_single_prompt(prompt: str) -> dict:
+            """
+            Run devs.py, send prompt, capture response until next CLI prompt or EOF.
+            """
             child = pexpect.spawn("python3", [DEVSPY], encoding="utf-8", timeout=180)
             try:
               child.expect(r'Chat started', timeout=60)
@@ -148,7 +199,8 @@ jobs:
 
             child.sendline(prompt)
 
-            buf=[]
+            buf = []
+            # read until the CLI emits a fresh prompt line or EOF
             while True:
               try:
                 line = child.readline()
@@ -156,6 +208,7 @@ jobs:
                 break
               if not line:
                 break
+              # devs.py CLI prompt usually starts with "> " on a new line
               if line.strip().startswith("> "):
                 break
               buf.append(line)
@@ -166,37 +219,38 @@ jobs:
             except Exception:
               pass
 
-            ai_text="".join(buf)
+            ai_text = "".join(buf)
             label, conf, reason = parse_ai_text(ai_text)
-            return {"label":label, "confidence":conf, "reason":reason, "suggestions":""}
+            return {"label": label, "confidence": conf, "reason": reason, "suggestions": ""}
 
-          def safe_path(p:str)->bool:
-            p=p.lower(); return any(h in p for h in SAFE_HINTS)
+          def safe_path(p: str) -> bool:
+            p = p.lower()
+            return any(h in p for h in SAFE_HINTS)
 
-          # 1) Pull alerts (existing in Security tab)
-          alerts=[]; page=1
-          while len(alerts)<MAX_ALERTS:
-            batch=list_alerts(ALERT_STATE, page, min(100, MAX_ALERTS-len(alerts)))
-            if not batch: break
-            alerts.extend(batch); page+=1
+          # 1) Pull alerts
+          alerts = []; page = 1
+          while len(alerts) < MAX_ALERTS:
+            batch = list_alerts(ALERT_STATE, page, min(100, MAX_ALERTS - len(alerts)))
+            if not batch:
+              break
+            alerts.extend(batch); page += 1
 
-          # Only CodeQL alerts
-          alerts=[a for a in alerts if (a.get("tool") or {}).get("name","").lower()=="codeql"]
+          alerts = [a for a in alerts if (a.get("tool") or {}).get("name","").lower() == "codeql"]
 
           # 2) Triage
-          triaged=[]
+          triaged = []
           for a in alerts:
-            inst=a.get("most_recent_instance") or {}
-            loc=(inst.get("location") or {})
-            path=loc.get("path") or ""
-            start=loc.get("start_line") or 1
-            end=loc.get("end_line") or start
+            inst = a.get("most_recent_instance") or {}
+            loc = (inst.get("location") or {})
+            path = loc.get("path") or ""
+            start = loc.get("start_line") or 1
+            end = loc.get("end_line") or start
             ref_sha = inst.get("commit_sha") or a.get("most_recent_analysis_commit_sha") or "HEAD"
-            snippet=get_file_snippet(path, ref_sha, start, end)
-            prompt=prompt_for_alert(a, snippet)
-            ai=devs_single_prompt(prompt)
+            snippet = get_file_snippet(path, ref_sha, start, end)
+            prompt = prompt_for_alert(a, snippet)
+            ai = devs_single_prompt(prompt)
 
-            rec={
+            rec = {
               "alert_number": a.get("number"),
               "rule_id": (a.get("rule") or {}).get("id"),
               "severity": a.get("rule_severity") or a.get("severity"),
@@ -208,15 +262,15 @@ jobs:
               "dismissed": False
             }
 
-            if AUTO_DISMISS and rec["ai_label"]=="likely_false_positive" and rec["confidence"] in ("high","medium") and safe_path(path):
-              url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
-              r=sess.patch(url, json={"state":"dismissed","dismissed_reason":DISMISS_REASON}, timeout=60)
-              rec["dismissed"]= r.status_code in (200,201)
+            if AUTO_DISMISS and rec["ai_label"] == "likely_false_positive" and rec["confidence"] in ("high","medium") and safe_path(path):
+              url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
+              r = sess.patch(url, json={"state": "dismissed", "dismissed_reason": DISMISS_REASON}, timeout=60)
+              rec["dismissed"] = r.status_code in (200,201)
 
             triaged.append(rec)
 
-          # 3) Summary table (Actions job summary)
-          md=[
+          # 3) Summary table
+          md = [
             f"Scope: state={ALERT_STATE} | Reviewed: {len(triaged)} | Auto-dismiss: {'Yes' if AUTO_DISMISS else 'No'}",
             "",
             "| Alert # | Rule | Sev | Path | AI label | Conf | Dismissed |",
@@ -228,7 +282,7 @@ jobs:
             with open(SUMMARY_PATH, "a", encoding="utf-8") as f:
               f.write("\n".join(md) + "\n")
 
-          # 4) Artifact (full reasoning)
+          # 4) Artifact
           with open("devs-ai-triage.json","w",encoding="utf-8") as f:
             json.dump(triaged, f, indent=2)
 
