@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install regex tqdm
 
-      - name: Generate repo context (summary + cards)
+      - name: Generate repo context (summary + file cards)
         shell: bash
         run: |
           python - << 'PY'
@@ -60,13 +60,10 @@ jobs:
             except: return ""
 
           files = [p for p in ROOT.rglob("*") if want(p)]
-
-          # ----- repo-wide heuristics -----
           all_code = "\n".join(read_text(p) for p in files[:5000])
 
           def has(pat): return re.search(pat, all_code, re.I) is not None
 
-          # auth transport guess
           auth_model = "unknown"
           if has(r'\bAuthorization\b') or has(r'\breq\.headers\.authorization\b'):
             auth_model = "header-jwt"
@@ -102,7 +99,6 @@ jobs:
           }
           (OUT/"repo_summary.json").write_text(json.dumps(repo_summary, indent=2), encoding="utf-8")
 
-          # ----- per-file cards -----
           def extract_endpoints(txt: str, suffix: str):
             endpoints = []
             if suffix in (".js",".ts",".jsx",".tsx"):
@@ -155,6 +151,7 @@ jobs:
               imports   = extract_imports(txt, suffix)
               sinks, sources = extract_sinks_sources(txt)
               san, val  = extract_sanitizers_validators(txt)
+
               summary_bits = []
               if endpoints: summary_bits.append(f"{len(endpoints)} endpoints")
               if "Authorization" in txt: summary_bits.append("reads Authorization header")
@@ -162,6 +159,7 @@ jobs:
               if san: summary_bits.append("sanitizers present")
               if val: summary_bits.append("validators present")
               summary = "; ".join(summary_bits) or "general module"
+
               row = {
                 "path": str(p.as_posix()),
                 "language": suffix.lstrip("."),
@@ -318,7 +316,6 @@ jobs:
               if len(uniq)>=k: break
             return uniq
 
-          # --- Prompt (few-shot JSON) ---
           def prompt_for_alert(a, snippet, bundle_cards):
             rule=a.get("rule",{}) or {}
             tool=(a.get("tool") or {}).get("name","")
@@ -412,10 +409,40 @@ jobs:
               pass
             return "".join(buf).strip()
 
+          # --- JSON extraction helpers (no PCRE recursion) ---
           FENCED_JSON_RX = re.compile(r"```json\s*(\{.*?\})\s*```", re.S|re.I)
-          BARE_JSON_RX   = re.compile(r"(\{(?:[^{}]|(?1))*\})", re.S)
-          VERDICT_RX = re.compile(r'^\s*(?:Verdict|Decision|Assessment|Triage\s*decision)\s*:\s*((?:Likely\s+)?(?:REAL_ISSUE|FALSE_POSITIVE))\b', re.I|re.M)
 
+          def first_json_object(text: str, max_len: int = 200_000):
+            """Find the first balanced JSON object by scanning braces."""
+            if not text: return None
+            text = text if len(text) <= max_len else text[:max_len]
+            m = FENCED_JSON_RX.search(text)
+            if m:
+              try: return json.loads(m.group(1))
+              except Exception: pass
+            opens = [i for i,ch in enumerate(text) if ch == "{"]
+            for start in opens:
+              depth = 0
+              in_str = False
+              escape = False
+              for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                  if escape: escape = False
+                  elif ch == "\\": escape = True
+                  elif ch == '"': in_str = False
+                else:
+                  if ch == '"': in_str = True
+                  elif ch == "{": depth += 1
+                  elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                      candidate = text[start:i+1]
+                      try: return json.loads(candidate)
+                      except Exception: break
+            return None
+
+          VERDICT_RX = re.compile(r'^\s*(?:Verdict|Decision|Assessment|Triage\s*decision)\s*:\s*((?:Likely\s+)?(?:REAL_ISSUE|FALSE_POSITIVE))\b', re.I|re.M)
           def map_old_verdict(tok: str):
             t=tok.upper().strip()
             likely=t.startswith("LIKELY ")
@@ -425,14 +452,9 @@ jobs:
             return ("UNCERTAIN", 50)
 
           def parse_ai_reply(text: str):
-            m = FENCED_JSON_RX.search(text or "")
-            if m:
-              try: return json.loads(m.group(1))
-              except Exception: pass
-            m = BARE_JSON_RX.search(text or "")
-            if m:
-              try: return json.loads(m.group(1))
-              except Exception: pass
+            obj = first_json_object(text)
+            if obj is not None:
+              return obj
             for m in VERDICT_RX.finditer(text or ""):
               classification, certainty = map_old_verdict(m.group(1))
               return {
